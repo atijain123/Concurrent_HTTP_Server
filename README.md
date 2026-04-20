@@ -7,10 +7,9 @@ The server is written for POSIX socket environments such as Linux, macOS, or WSL
 ## Features
 
 - Concurrent request handling through a fixed-size FIFO thread pool.
-- HTTP/1.0 and HTTP/1.1 request parsing with header and body size limits.
+- HTTP/1.1 request parsing with header and body size limits.
 - Static file serving from a configurable document root.
 - Path normalization and root-bound path resolution to prevent directory traversal.
-- `POST /echo` endpoint for simple request-body testing.
 - Workload-aware in-memory cache with adaptive recency/frequency scoring.
 - Predictive prefetching for HTML-linked local CSS, JS, and image resources.
 - Structured request, info, and error logs in `logs/server.log`.
@@ -135,7 +134,6 @@ When the server starts, it prints the document root, monitoring dashboard URL, a
 | `GET` | `/monitor/` | Serves the React monitoring dashboard. |
 | `GET` | `/metrics` | Returns live server metrics as JSON. |
 | `GET` | `/metrics-view` | Serves a built-in HTML metrics page. |
-| `POST` | `/echo` | Returns posted body content as JSON. |
 | `GET` | any static path | Serves files below the configured document root. |
 
 Unsupported methods return `405 Method Not Allowed`. Nonexistent files return `404 Not Found`. Idle or slow clients that do not send a complete request before the socket receive timeout get `408 Request Timeout`.
@@ -176,7 +174,7 @@ Connections are closed after each response. Persistent keep-alive is not impleme
 The parser:
 
 - Reads headers until `\r\n\r\n`.
-- Supports HTTP/1.0 and HTTP/1.1 request lines.
+- Supports HTTP/1.1 request lines.
 - Normalizes header names to lowercase.
 - Supports `Content-Length` bodies up to 2 MB by default.
 - Rejects chunked transfer encoding.
