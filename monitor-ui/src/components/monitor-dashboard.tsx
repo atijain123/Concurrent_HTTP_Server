@@ -57,9 +57,7 @@ export function MonitorDashboard() {
   >([]);
   const [updatedAt, setUpdatedAt] = useState<string | null>(null);
 
-  const effectiveRps = metrics
-    ? Math.max(metrics.requests_per_second, 1)
-    : null;
+  const effectiveRps = metrics ? metrics.requests_per_second : null;
 
   const fetchMetrics = useCallback(async () => {
     try {
@@ -68,14 +66,13 @@ export function MonitorDashboard() {
         throw new Error(`HTTP ${res.status}`);
       }
       const m = (await res.json()) as Metrics;
-      const normalizedRps = Math.max(m.requests_per_second, 1);
       setMetrics(m);
       setError(null);
       setLoading(false);
       setUpdatedAt(new Date().toLocaleTimeString());
       const label = new Date().toLocaleTimeString();
       setRpsSeries((prev) => {
-        const next = [...prev, { t: label, rps: normalizedRps }];
+        const next = [...prev, { t: label, rps: m.requests_per_second }];
         return next.length > RPS_HISTORY ? next.slice(-RPS_HISTORY) : next;
       });
     } catch (e) {
