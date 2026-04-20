@@ -32,19 +32,29 @@ void CloseSocketQuietly(int fd) {
   }
 }
 
+bool IsInternalMonitoringPath(const std::string& path) {
+  return path == "/metrics" || path == "/metrics-view" || path == "/monitor" ||
+         path == "/monitor/" || path.rfind("/monitor/", 0) == 0;
+}
+
+std::string CacheKeyForPath(const std::string& normalized_path) {
+  if (normalized_path == "/") {
+    return "/index.html";
+  }
+  if (!normalized_path.empty() && normalized_path.back() == '/') {
+    return normalized_path + "index.html";
+  }
+  return normalized_path;
+}
+
 class ConnectionGuard {
  public:
-  ConnectionGuard(int fd, MetricsCollector& metrics)
-      : fd_(fd), metrics_(metrics) {}
+  explicit ConnectionGuard(int fd) : fd_(fd) {}
 
-  ~ConnectionGuard() {
-    CloseSocketQuietly(fd_);
-    metrics_.ConnectionClosed();
-  }
+  ~ConnectionGuard() { CloseSocketQuietly(fd_); }
 
  private:
   int fd_;
-  MetricsCollector& metrics_;
 };
 
 }  // namespace
@@ -186,24 +196,25 @@ void HttpServer::AcceptLoop() {
         ::inet_ntop(AF_INET, &client_address.sin_addr, ip_buffer, sizeof(ip_buffer));
     const std::string client_ip = ip != nullptr ? ip : "unknown";
 
-    metrics_.ConnectionOpened();
     try {
       thread_pool_.Enqueue(
           [this, client_fd, client_ip] { HandleClient(client_fd, client_ip); });
     } catch (const std::exception& ex) {
       CloseSocketQuietly(client_fd);
-      metrics_.ConnectionClosed();
       logger_.LogError(std::string("Failed to enqueue client task: ") + ex.what());
     }
   }
 }
 
 void HttpServer::HandleClient(int client_fd, const std::string& client_ip) {
-  ConnectionGuard connection_guard(client_fd, metrics_);
+  ConnectionGuard connection_guard(client_fd);
 
   HttpResponse response;
   std::optional<bool> cache_lookup;
   std::string resource = "<parse-error>";
+  bool is_internal_monitoring_request = false;
+  bool should_record_client_request = false;
+  bool active_client_connection_recorded = false;
 
   try {
     const auto parse_result = HttpParser::ReadFromSocket(client_fd);
@@ -213,6 +224,12 @@ void HttpServer::HandleClient(int client_fd, const std::string& client_ip) {
       response.body = parse_result.error_message + "\n";
     } else {
       resource = parse_result.request.path;
+      is_internal_monitoring_request = IsInternalMonitoringPath(resource);
+      should_record_client_request = !is_internal_monitoring_request;
+      if (should_record_client_request) {
+        metrics_.ConnectionOpened();
+        active_client_connection_recorded = true;
+      }
       response = HandleRequest(parse_result.request, &cache_lookup);
     }
   } catch (const std::exception& ex) {
@@ -222,22 +239,27 @@ void HttpServer::HandleClient(int client_fd, const std::string& client_ip) {
     response.body = "500 Internal Server Error\n";
   }
 
-  if (!SendResponse(client_fd, response)) {
+  if (!SendResponse(client_fd, response) && should_record_client_request) {
     logger_.LogError("Failed to send response to " + client_ip);
   }
 
-  metrics_.RequestCompleted();
-  if (cache_lookup.has_value()) {
-    if (*cache_lookup) {
-      metrics_.RecordCacheHit();
-    } else {
-      metrics_.RecordCacheMiss();
+  if (should_record_client_request) {
+    metrics_.RequestCompleted();
+    if (cache_lookup.has_value()) {
+      if (*cache_lookup) {
+        metrics_.RecordCacheHit();
+      } else {
+        metrics_.RecordCacheMiss();
+      }
     }
+    const auto snapshot = metrics_.Snapshot();
+    cache_.AdjustWeights(snapshot.cache_hit_rate);
+    logger_.LogRequest(client_ip, resource, response.status_code);
   }
-  const auto snapshot = metrics_.Snapshot();
-  cache_.AdjustWeights(snapshot.cache_hit_rate);
   UpdateApproximateMemoryMetric();
-  logger_.LogRequest(client_ip, resource, response.status_code);
+  if (active_client_connection_recorded) {
+    metrics_.ConnectionClosed();
+  }
 }
 
 HttpResponse HttpServer::HandleRequest(const HttpRequest& request,
@@ -288,6 +310,9 @@ HttpResponse HttpServer::ServeStaticFile(const HttpRequest& request,
 
   const std::string normalized_path =
       request.path.empty() ? "/" : utils::NormalizeUrlPath(request.path);
+  const std::string cache_key = CacheKeyForPath(normalized_path);
+  const bool is_internal_monitoring_path =
+      IsInternalMonitoringPath(normalized_path);
   const bool is_monitor_spa =
       normalized_path == "/monitor/" ||
       normalized_path == "/monitor/index.html";
@@ -302,28 +327,27 @@ HttpResponse HttpServer::ServeStaticFile(const HttpRequest& request,
     return HttpResponse{404, "text/plain; charset=utf-8", "404 Not Found\n", {}};
   }
 
-  CacheResult cached;
-  if (cache_.Get(normalized_path, &cached)) {
-    if (cache_lookup != nullptr) {
-      *cache_lookup = true;
-    }
+  if (!is_internal_monitoring_path) {
+    CacheResult cached;
+    if (cache_.Get(cache_key, &cached)) {
+      if (cache_lookup != nullptr) {
+        *cache_lookup = true;
+      }
 
-    HttpResponse response;
-    response.status_code = 200;
-    response.content_type = cached.content_type;
-    response.body = *cached.content;
+      HttpResponse response;
+      response.status_code = 200;
+      response.content_type = cached.content_type;
+      response.body = *cached.content;
 
-    if (is_monitor_spa) {
-      response.headers.emplace_back("Cache-Control", "no-store");
+      if (request.method == "GET" &&
+          response.content_type.rfind("text/html", 0) == 0) {
+        prefetcher_.ScheduleHtmlPrefetch(cache_key, response.body);
+      }
+      return response;
     }
-    if (request.method == "GET" &&
-        response.content_type.rfind("text/html", 0) == 0) {
-      prefetcher_.ScheduleHtmlPrefetch(normalized_path, response.body);
-    }
-    return response;
   }
 
-  if (cache_lookup != nullptr) {
+  if (cache_lookup != nullptr && !is_internal_monitoring_path) {
     *cache_lookup = false;
   }
 
@@ -334,18 +358,20 @@ HttpResponse HttpServer::ServeStaticFile(const HttpRequest& request,
   }
 
   const std::string content_type = utils::GetMimeType(file_path);
-  cache_.Put(normalized_path, content, content_type, 1);
-  UpdateApproximateMemoryMetric();
+  if (!is_internal_monitoring_path) {
+    cache_.Put(cache_key, content, content_type, 1);
+    UpdateApproximateMemoryMetric();
 
-  if (request.method == "GET" && content_type.rfind("text/html", 0) == 0) {
-    prefetcher_.ScheduleHtmlPrefetch(normalized_path, content);
+    if (request.method == "GET" && content_type.rfind("text/html", 0) == 0) {
+      prefetcher_.ScheduleHtmlPrefetch(cache_key, content);
+    }
   }
 
   HttpResponse response;
   response.status_code = 200;
   response.content_type = content_type;
   response.body = std::move(content);
-  if (is_monitor_spa) {
+  if (is_internal_monitoring_path || is_monitor_spa) {
     response.headers.emplace_back("Cache-Control", "no-store");
   }
   return response;
@@ -492,8 +518,9 @@ h1 {
 
   HttpResponse res;
   res.status_code = 200;
-  res.content_type = "text/html";
+  res.content_type = "text/html; charset=utf-8";
   res.body = html.str();
+  res.headers.emplace_back("Cache-Control", "no-store");
   return res;
 }
 HttpResponse HttpServer::HandleEchoPost(const HttpRequest& request) const {

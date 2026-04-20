@@ -16,6 +16,17 @@ namespace {
 
 constexpr std::size_t kReadBufferSize = 4096;
 
+bool IsReceiveTimeout(int error_code) {
+  return error_code == EAGAIN
+#if EWOULDBLOCK != EAGAIN
+      || error_code == EWOULDBLOCK
+#endif
+#ifdef ETIMEDOUT
+      || error_code == ETIMEDOUT
+#endif
+      ;
+}
+
 void StripCarriageReturn(std::string* line) {
   if (line != nullptr && !line->empty() && line->back() == '\r') {
     line->pop_back();
@@ -147,12 +158,23 @@ HttpParser::ParseResult HttpParser::ReadFromSocket(int client_socket,
       if (errno == EINTR) {
         continue;
       }
-      result.status_code = 500;
-      result.error_message = std::string("recv failed: ") + std::strerror(errno);
+      if (IsReceiveTimeout(errno)) {
+        result.status_code = 408;
+        result.error_message = "Request timed out while reading headers";
+      } else {
+        result.status_code = 400;
+        result.error_message =
+            std::string("Unable to read request: ") + std::strerror(errno);
+      }
       return result;
     }
 
     buffer.append(read_buffer, static_cast<std::size_t>(received));
+    if (buffer.size() > max_header_bytes) {
+      result.status_code = 400;
+      result.error_message = "Request headers too large";
+      return result;
+    }
   }
 
   const std::string header_block = buffer.substr(0, header_end);
@@ -202,8 +224,14 @@ HttpParser::ParseResult HttpParser::ReadFromSocket(int client_socket,
       if (errno == EINTR) {
         continue;
       }
-      result.status_code = 500;
-      result.error_message = std::string("recv failed: ") + std::strerror(errno);
+      if (IsReceiveTimeout(errno)) {
+        result.status_code = 408;
+        result.error_message = "Request timed out while reading body";
+      } else {
+        result.status_code = 400;
+        result.error_message =
+            std::string("Unable to read request body: ") + std::strerror(errno);
+      }
       return result;
     }
     buffer.append(read_buffer, static_cast<std::size_t>(received));

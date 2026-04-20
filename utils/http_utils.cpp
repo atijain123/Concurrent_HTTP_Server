@@ -107,12 +107,16 @@ std::string StatusText(int status_code) {
   switch (status_code) {
     case 200:
       return "OK";
+    case 302:
+      return "Found";
     case 400:
       return "Bad Request";
     case 404:
       return "Not Found";
     case 405:
       return "Method Not Allowed";
+    case 408:
+      return "Request Timeout";
     case 413:
       return "Payload Too Large";
     case 500:

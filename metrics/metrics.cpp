@@ -15,7 +15,12 @@ void MetricsCollector::ConnectionOpened() {
 }
 
 void MetricsCollector::ConnectionClosed() {
-  active_connections_.fetch_sub(1, std::memory_order_relaxed);
+  std::size_t current = active_connections_.load(std::memory_order_relaxed);
+  while (current > 0 &&
+         !active_connections_.compare_exchange_weak(
+             current, current - 1, std::memory_order_relaxed,
+             std::memory_order_relaxed)) {
+  }
 }
 
 void MetricsCollector::RequestCompleted() {

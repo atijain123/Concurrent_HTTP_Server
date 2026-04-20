@@ -55,6 +55,7 @@ The server is written for POSIX socket environments such as Linux, macOS, or WSL
 |   `-- http_utils.cpp
 `-- www/
     |-- index.html
+    |-- web/
     `-- monitor/
 ```
 
@@ -129,6 +130,7 @@ When the server starts, it prints the document root, monitoring dashboard URL, a
 | Method | Path | Description |
 | --- | --- | --- |
 | `GET` | `/` | Serves `www/index.html`. |
+| `GET` | `/web/` | Serves the hosted website content. |
 | `GET` | `/monitor` | Redirects to `/monitor/`. |
 | `GET` | `/monitor/` | Serves the React monitoring dashboard. |
 | `GET` | `/metrics` | Returns live server metrics as JSON. |
@@ -136,7 +138,7 @@ When the server starts, it prints the document root, monitoring dashboard URL, a
 | `POST` | `/echo` | Returns posted body content as JSON. |
 | `GET` | any static path | Serves files below the configured document root. |
 
-Unsupported methods return `405 Method Not Allowed`. Nonexistent files return `404 Not Found`.
+Unsupported methods return `405 Method Not Allowed`. Nonexistent files return `404 Not Found`. Idle or slow clients that do not send a complete request before the socket receive timeout get `408 Request Timeout`.
 
 ## Configuration
 
@@ -164,7 +166,7 @@ Command-line arguments can override port, document root, thread count, and cache
 1. `main.cpp` builds a `ServerConfig`, installs shutdown handlers, starts `HttpServer`, and waits for `SIGINT` or `SIGTERM`.
 2. `HttpServer::Start()` creates the listening socket, starts the worker pool, starts the prefetcher, and launches an accept thread.
 3. The accept loop accepts TCP clients, applies socket timeouts, records active connections, and enqueues each client into the thread pool.
-4. A worker parses one request, routes it, sends one response, records metrics, adjusts the cache strategy, and closes the connection.
+4. A worker parses one request, routes it, sends one response, records client-facing metrics for non-internal routes, adjusts the cache strategy, and closes the connection.
 5. Static `GET` requests first check the cache. Misses read from disk, populate the cache, and may trigger HTML resource prefetching.
 
 Connections are closed after each response. Persistent keep-alive is not implemented.
@@ -203,9 +205,11 @@ Resolution rules:
 
 MIME types are selected from common file extensions in `utils/http_utils.cpp`.
 
+The `www/web/` directory is the intended location for the hosted website. Monitoring files under `/monitor/` and metrics endpoints are internal server UI/API routes; they are served without being inserted into the workload-aware cache and without contributing to client-facing traffic counters or access logs.
+
 ## Workload-Aware Cache
 
-The cache stores file content, content type, file size, access frequency, last access time, and eviction metadata.
+The cache stores hosted website file content, content type, file size, access frequency, last access time, and eviction metadata. Internal monitoring and metrics routes are not stored in the cache.
 
 Each entry keeps precomputed scores for the three supported cache profiles:
 
@@ -280,7 +284,7 @@ Successful prefetches are inserted into the same workload-aware cache and logged
 }
 ```
 
-Metrics are updated after each handled request. Requests per second is calculated from request completion timestamps in the last one-second window.
+Metrics are updated after each handled non-internal request. Requests per second is calculated from client request completion timestamps in the last one-second window, so opening the monitoring dashboard does not inflate the displayed traffic. Active connections also represent client website requests, not monitoring or metrics polling.
 
 ## Monitoring Dashboard
 
